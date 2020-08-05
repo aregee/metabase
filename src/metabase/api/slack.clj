@@ -1,38 +1,30 @@
 (ns metabase.api.slack
   "/api/slack endpoints"
-  (:require [clojure.tools.logging :as log]
-            [clojure.set :as set]
-            [cheshire.core :as cheshire]
-            [compojure.core :refer [GET PUT DELETE POST]]
-            [metabase.api.common :refer :all]
+  (:require [compojure.core :refer [PUT]]
+            [metabase.api.common :as api]
             [metabase.config :as config]
-            [metabase.integrations [slack :refer [slack-api-get]]]
-            [metabase.models.setting :as setting]))
+            [metabase.integrations.slack :as slack]
+            [metabase.models.setting :as setting]
+            [metabase.util
+             [i18n :refer [tru]]
+             [schema :as su]]
+            [schema.core :as s]))
 
-(defn- humanize-error-messages
-  "Convert raw error message responses from Slack into our normal api error response structure."
-  [response body]
-  (case (get body "error")
-    "invalid_auth" {:errors {:slack-token "Invalid token"}}
-    {:message "Sorry, something went wrong.  Please try again."}))
+(api/defendpoint PUT "/settings"
+  "Update Slack related settings. You must be a superuser to do this."
+  [:as {{slack-token :slack-token, metabot-enabled :metabot-enabled, :as slack-settings} :body}]
+  {slack-token     (s/maybe su/NonBlankString)
+   metabot-enabled s/Bool}
+  (api/check-superuser)
+  (if-not slack-token
+    (setting/set-many! {:slack-token nil, :metabot-enabled false})
+    (try
+      (when-not config/is-test?
+        (when-not (slack/valid-token? slack-token)
+          (throw (ex-info (tru "Invalid Slack token.") {:status-code 400}))))
+      (setting/set-many! slack-settings)
+      {:ok true}
+      (catch clojure.lang.ExceptionInfo info
+        {:status 400, :body (ex-data info)}))))
 
-(defendpoint PUT "/settings"
-  "Update multiple `Settings` values.  You must be a superuser to do this."
-  [:as {settings :body}]
-  {settings [Required Dict]}
-  (check-superuser)
-  (let [slack-token (:slack-token settings)
-        response    (if-not (config/is-test?)
-                      ;; in normal conditions, validate connection
-                      (slack-api-get slack-token "channels.list" {:exclude_archived 1})
-                      ;; for unit testing just respond with a success message
-                      {:status 200 :body "{\"ok\":true}"})
-        body        (if (= 200 (:status response)) (cheshire/parse-string (:body response)))]
-    (if (= true (get body "ok"))
-      ;; test was good, save our settings
-      (setting/set :slack-token slack-token)
-      ;; test failed, return response message
-      {:status 500
-       :body   (humanize-error-messages response body)})))
-
-(define-routes)
+(api/define-routes)

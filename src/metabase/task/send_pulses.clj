@@ -1,142 +1,125 @@
 (ns metabase.task.send-pulses
   "Tasks related to running `Pulses`."
-  (:require [clojure.tools.logging :as log]
-            [cheshire.core :as cheshire]
-            (clojurewerkz.quartzite [jobs :as jobs]
-                                    [triggers :as triggers])
+  (:require [clj-time
+             [core :as time]
+             [predicates :as timepr]]
+            [clojure.tools.logging :as log]
+            [clojurewerkz.quartzite
+             [jobs :as jobs]
+             [triggers :as triggers]]
             [clojurewerkz.quartzite.schedule.cron :as cron]
-            [clj-time.core :as time]
-            [metabase.db :as db]
-            [metabase.driver :as driver]
-            [metabase.email :as email]
-            [metabase.email.messages :as messages]
-            [metabase.integrations.slack :as slack]
-            (metabase.models [card :refer [Card]]
-                             [hydrate :refer :all]
-                             [pulse :refer [Pulse] :as pulse]
-                             [pulse-channel :as pulse-channel]
-                             [setting :as setting])
-            [metabase.task :as task]
-            [metabase.util :as u]
-            [metabase.pulse :as p]))
+            [metabase
+             [pulse :as p]
+             [task :as task]]
+            [metabase.models
+             [pulse :as pulse]
+             [pulse-channel :as pulse-channel]
+             [setting :as setting]
+             [task-history :as task-history]]
+            [metabase.util.i18n :refer [trs]]
+            [schema.core :as s]))
+
+;;; ------------------------------------------------- PULSE SENDING --------------------------------------------------
+
+(defn- log-pulse-exception [pulse-id exception]
+  (log/error exception (trs "Error sending Pulse {0}" pulse-id)))
+
+(def ^:private Hour
+  (s/constrained
+   s/Int
+   #(and (<= 0 %) (>= 23 %))
+   "valid hour"))
+
+(def ^:private Weekday
+  (s/pred pulse-channel/day-of-week? "valid day of week"))
+
+(def ^:private MonthDay
+  (s/enum :first :last :mid :other))
+
+(def ^:private MonthWeek
+  (s/enum :first :last :other))
+
+(s/defn ^:private send-pulses!
+  "Send any `Pulses` which are scheduled to run in the current day/hour. We use the current time and determine the
+  hour of the day and day of the week according to the defined reporting timezone, or UTC. We then find all `Pulses`
+  that are scheduled to run and send them. The `on-error` function is called if an exception is thrown when sending
+  the pulse. Since this is a background process, the exception is only logged and not surfaced to the user. The
+  `on-error` function makes it easier to test for when an error doesn't occur"
+  ([hour weekday monthday monthweek]
+   (send-pulses! hour weekday monthday monthweek log-pulse-exception))
+
+  ([hour :- Hour, weekday :- Weekday, monthday :- MonthDay, monthweek :- MonthWeek, on-error]
+   (log/info (trs "Sending scheduled pulses..."))
+   (let [pulse-id->channels (group-by :pulse_id (pulse-channel/retrieve-scheduled-channels hour weekday monthday monthweek))]
+     (doseq [[pulse-id channels] pulse-id->channels]
+       (try
+         (task-history/with-task-history {:task (format "send-pulse %s" pulse-id)}
+           (log/debug (trs "Starting Pulse Execution: {0}" pulse-id))
+           (when-let [pulse (pulse/retrieve-notification pulse-id :archived false)]
+             (p/send-pulse! pulse :channel-ids (map :id channels)))
+           (log/debug (trs "Finished Pulse Execution: {0}" pulse-id)))
+         (catch Throwable e
+           (on-error pulse-id e)))))))
 
 
-(declare send-pulses)
+;;; ------------------------------------------------------ Task ------------------------------------------------------
 
-(def send-pulses-job-key "metabase.task.send-pulses.job")
-(def send-pulses-trigger-key "metabase.task.send-pulses.trigger")
+(defn- monthday [dt]
+  (cond
+    (timepr/first-day-of-month? dt) :first
+    (timepr/last-day-of-month? dt)  :last
+    (= 15 (time/day dt))            :mid
+    :else                           :other))
 
-(defonce ^:private send-pulses-job (atom nil))
-(defonce ^:private send-pulses-trigger (atom nil))
+(defn- monthweek [dt]
+  (let [curr-day-of-month  (time/day dt)
+        last-of-month      (time/day (time/last-day-of-the-month dt))
+        start-of-last-week (- last-of-month 7)]
+    (cond
+      (> 8 curr-day-of-month)                  :first
+      (< start-of-last-week curr-day-of-month) :last
+      :else                                    :other)))
 
 ;; triggers the sending of all pulses which are scheduled to run in the current hour
-(jobs/defjob SendPulses
-  [ctx]
-  ;; determine what time it is right now (hour-of-day & day-of-week) in reporting timezone
-  (let [reporting-timezone (setting/get :report-timezone)
-        now                (if (empty? reporting-timezone)
-                             (time/now)
-                             (time/to-time-zone (time/now) (time/time-zone-for-id reporting-timezone)))
-        curr-hour          (time/hour now)
-        curr-weekday       (->> (time/day-of-week now)
-                                (get pulse-channel/days-of-week)
-                                :id)]
-    (send-pulses curr-hour curr-weekday)))
+(jobs/defjob SendPulses [_]
+  (try
+    (task-history/with-task-history {:task "send-pulses"}
+      ;; determine what time it is right now (hour-of-day & day-of-week) in reporting timezone
+      (let [reporting-timezone (setting/get :report-timezone)
+            now                (if (empty? reporting-timezone)
+                                 (time/now)
+                                 (time/to-time-zone (time/now) (time/time-zone-for-id reporting-timezone)))
+            curr-hour          (time/hour now)
+            ;; joda time produces values of 1-7 here (Mon -> Sun) and we subtract 1 from it to
+            ;; make the values zero based to correspond to the indexes in pulse-channel/days-of-week
+            curr-weekday       (->> (dec (time/day-of-week now))
+                                    (get pulse-channel/days-of-week)
+                                    :id)
+            curr-monthday      (monthday now)
+            curr-monthweek     (monthweek now)]
+        (send-pulses! curr-hour curr-weekday curr-monthday curr-monthweek)))
+    (catch Throwable e
+      (log/error e (trs "SendPulses task failed")))))
 
-(defn task-init []
-  (log/info "Submitting send-pulses task to scheduler")
-  ;; build our job
-  (reset! send-pulses-job (jobs/build
-                               (jobs/of-type SendPulses)
-                               (jobs/with-identity (jobs/key send-pulses-job-key))))
-  ;; build our trigger
-  (reset! send-pulses-trigger (triggers/build
-                                   (triggers/with-identity (triggers/key send-pulses-trigger-key))
-                                   (triggers/start-now)
-                                   (triggers/with-schedule
-                                     ;; run at the top of every hour
-                                     (cron/schedule (cron/cron-schedule "0 0 * * * ? *")))))
-  ;; submit ourselves to the scheduler
-  (task/schedule-task! @send-pulses-job @send-pulses-trigger))
+(def ^:private send-pulses-job-key     "metabase.task.send-pulses.job")
+(def ^:private send-pulses-trigger-key "metabase.task.send-pulses.trigger")
 
-
-;;; ## ---------------------------------------- PULSE SENDING ----------------------------------------
-
-
-;; TODO: this is probably something that could live somewhere else and just be reused by us
-(defn- ^:private execute-card
-  "Execute the query for a single card."
-  [card-id]
-  {:pre [(integer? card-id)]}
-  (let [card (db/sel :one Card :id card-id)
-        {:keys [creator_id dataset_query]} card]
-    (try
-      {:card card :result (driver/dataset-query dataset_query {:executed_by creator_id})}
-      (catch Throwable t
-        (log/warn (format "Error running card query (%n)" card-id) t)))))
-
-(defn send-pulse-email
-  "Send a `Pulse` email given a list of card results to render and a list of recipients to send to."
-  [{:keys [id name] :as pulse} results recipients]
-  (log/debug (format "Sending Pulse (%d: %s) via Channel :email" id name))
-  (let [email-subject    (str "Pulse: " name)
-        email-recipients (filterv u/is-email? (map :email recipients))]
-    (email/send-message
-      :subject      email-subject
-      :recipients   email-recipients
-      :message-type :attachments
-      :message      (messages/render-pulse-email pulse results))))
-
-(defn- create-slack-attachment
-  "Create an attachment in Slack for a given Card by rendering its result into an image and uploading it."
-  [{{:keys [id name] :as card} :card, {:keys [data]} :result}]
-  (let [image-byte-array (p/render-pulse-card-to-png card data false)
-        upload-result    (slack/files-upload image-byte-array)]
-    {:title      name
-     :title_link (format "%s/card/%d?clone" (setting/get :-site-url) id)
-     :image_url  (-> upload-result :file :url)
-     :fallback   name}))
-
-(defn send-pulse-slack
-  "Post a `Pulse` to a slack channel given a list of card results to render and details about the slack destination."
-  [{:keys [id name]} results details]
-  (log/debug (format "Sending Pulse (%d: %s) via Channel :slack" id name))
-  (let [attachments (mapv create-slack-attachment results)]
-    (slack/chat-post-message (:channel details)
-                             (str "Pulse: " name)
-                             (cheshire/generate-string attachments))))
-
-(defn send-pulse
-  "Execute and Send a `Pulse`, optionally specifying the specific `PulseChannels`.  This includes running each
-   `PulseCard`, formatting the results, and sending the results to any specified destination.
-
-   Example:
-       (send-pulse pulse)                       Send to all Channels
-       (send-pulse pulse :channel-ids [312])    Send only to Channel with :id = 312"
-  [{:keys [cards] :as pulse} & {:keys [channel-ids]}]
-  {:pre [(map? pulse)]}
-  (let [results  (map execute-card (mapv :id cards))
-        channels (or channel-ids (mapv :id (:channels pulse)))]
-    (doseq [channel-id channels]
-      (let [{:keys [channel_type details recipients]} (first (filter #(= channel-id (:id %)) (:channels pulse)))]
-        (cond
-          (= :email (keyword channel_type)) (send-pulse-email pulse results recipients)
-          (= :slack (keyword channel_type)) (send-pulse-slack pulse results details))))))
-
-(defn send-pulses
-  "Send any `Pulses` which are scheduled to run in the current day/hour.  We use the current time and determine the
-   hour of the day and day of the week according to the defined reporting timezone, or UTC.  We then find all `Pulses`
-   that are scheduled to run and send them."
-  [hour day]
-  [:pre [(integer? hour)
-         (and (< 0 hour) (> 23 hour))
-         (pulse-channel/day-of-week? day)]]
-  (let [channels-by-pulse (group-by :pulse_id (pulse-channel/retrieve-scheduled-channels hour day))]
-    (doseq [pulse-id (keys channels-by-pulse)]
-      (try
-        (log/debug (format "Starting Pulse Execution: %d" pulse-id))
-        (when-let [pulse (pulse/retrieve-pulse pulse-id)]
-          (send-pulse pulse :channel-ids (mapv :id (get channels-by-pulse pulse-id))))
-        (log/debug (format "Finished Pulse Execution: %d" pulse-id))
-        (catch Exception e
-          (log/error "Error sending pulse:" pulse-id e))))))
+(defmethod task/init! ::SendPulses [_]
+  (let [job     (jobs/build
+                 (jobs/of-type SendPulses)
+                 (jobs/with-identity (jobs/key send-pulses-job-key)))
+        trigger (triggers/build
+                 (triggers/with-identity (triggers/key send-pulses-trigger-key))
+                 (triggers/start-now)
+                 (triggers/with-schedule
+                   (cron/schedule
+                    ;; run at the top of every hour
+                    (cron/cron-schedule "0 0 * * * ? *")
+                    ;; If send-pulses! misfires, don't try to re-send all the misfired Pulses. Retry only the most
+                    ;; recent misfire, discarding all others. This should hopefully cover cases where a misfire
+                    ;; happens while the system is still running; if the system goes down for an extended period of
+                    ;; time we don't want to re-send tons of (possibly duplicate) Pulses.
+                    ;;
+                    ;; See https://www.nurkiewicz.com/2012/04/quartz-scheduler-misfire-instructions.html
+                    (cron/with-misfire-handling-instruction-fire-and-proceed))))]
+    (task/schedule-task! job trigger)))

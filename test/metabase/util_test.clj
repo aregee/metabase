@@ -1,133 +1,243 @@
 (ns metabase.util-test
   "Tests for functions in `metabase.util`."
-  (:require [expectations :refer :all]
-            [metabase.util :refer :all]))
+  (:require [clojure.test :refer :all]
+            [clojure.tools.macro :as tools.macro]
+            [flatland.ordered.map :refer [ordered-map]]
+            [metabase
+             [test :as mt]
+             [util :as u]]))
 
+(defn- are+-message [expr arglist args]
+  (pr-str
+   (second
+    (macroexpand-1
+     (list
+      `tools.macro/symbol-macrolet
+      (vec (apply concat (map-indexed (fn [i arg]
+                                        [arg (nth args i)])
+                                      arglist)))
+      expr)))))
 
-;;; Date stuff
+(defmacro ^:private are+
+  "Like `clojure.test/are` but includes a message for easier test failure debugging. (Also this is somewhat more
+  efficient since it generates far less code ­ it uses `doseq` rather than repeating the entire test each time.)
 
-(def ^:private ^:const friday-the-13th   #inst "2015-11-13T19:05:55")
-(def ^:private ^:const saturday-the-14th #inst "2015-11-14T04:18:26")
+  TODO ­ if this macro proves useful, we should consider moving it to somewhere more general, such as
+  `metabase.test`."
+  {:style/indent 2}
+  [argv expr & args]
+  `(doseq [args# ~(mapv vec (partition (count argv) args))
+           :let [~argv args#]]
+     (is ~expr
+         (are+-message '~expr '~argv args#))))
 
-(expect friday-the-13th (->Timestamp (->Date friday-the-13th)))
-(expect friday-the-13th (->Timestamp (->Calendar friday-the-13th)))
-(expect friday-the-13th (->Timestamp (->Calendar (.getTime friday-the-13th))))
-(expect friday-the-13th (->Timestamp (.getTime friday-the-13th)))
-(expect friday-the-13th (->Timestamp "2015-11-13T19:05:55+00:00"))
+(deftest host-up?-test
+  (testing "host-up?"
+    (are+ [s expected] (= expected
+                          (u/host-up? s))
+      "localhost"  true
+      "nosuchhost" false))
+  (testing "host-port-up?"
+    (is (= false
+           (u/host-port-up? "nosuchhost" 8005)))))
 
-(expect 5    (date-extract :minute-of-hour  friday-the-13th))
-(expect 19   (date-extract :hour-of-day     friday-the-13th))
-(expect 6    (date-extract :day-of-week     friday-the-13th))
-(expect 7    (date-extract :day-of-week     saturday-the-14th))
-(expect 13   (date-extract :day-of-month    friday-the-13th))
-(expect 317  (date-extract :day-of-year     friday-the-13th))
-(expect 46   (date-extract :week-of-year    friday-the-13th))
-(expect 11   (date-extract :month-of-year   friday-the-13th))
-(expect 4    (date-extract :quarter-of-year friday-the-13th))
-(expect 2015 (date-extract :year            friday-the-13th))
+(deftest url?-test
+  (are+ [s expected] (= expected
+                        (u/url? s))
+    "http://google.com"                                                                      true
+    "https://google.com"                                                                     true
+    "https://amazon.co.uk"                                                                   true
+    "http://google.com?q=my-query&etc"                                                       true
+    "http://www.cool.com"                                                                    true
+    "http://localhost/"                                                                      true
+    "http://localhost:3000"                                                                  true
+    "https://www.mapbox.com/help/data/stations.geojson"                                      true
+    "http://www.cool.com:3000"                                                               true
+    "http://localhost:3000/auth/reset_password/144_f98987de-53ca-4335-81da-31bb0de8ea2b#new" true
+    "http://192.168.1.10/"                                                                   true
+    "http://metabase.intranet/"                                                              true
+    ;; missing protocol
+    "google.com"                                                                             false
+    ;; protocol isn't HTTP/HTTPS
+    "ftp://metabase.com"                                                                     false
+    ;; no domain
+    "http://.com"                                                                            false
+    ;; no TLD
+    "http://google."                                                                         false
+    ;; no domain or tld
+    "http://"                                                                                false
+    ;; nil .getAuthority needs to be handled or NullPointerException
+    "http:/"                                                                                 false))
 
-(expect #inst "2015-11-13T19:05" (date-trunc :minute  friday-the-13th))
-(expect #inst "2015-11-13T19:00" (date-trunc :hour    friday-the-13th))
-(expect #inst "2015-11-13"       (date-trunc :day     friday-the-13th))
-(expect #inst "2015-11-08"       (date-trunc :week    friday-the-13th))
-(expect #inst "2015-11-08"       (date-trunc :week    saturday-the-14th))
-(expect #inst "2015-11-01"       (date-trunc :month   friday-the-13th))
-(expect #inst "2015-10-01"       (date-trunc :quarter friday-the-13th))
+(deftest qualified-name-test
+  (are+ [k expected] (= expected
+                        (u/qualified-name k))
+    :keyword                          "keyword"
+    :namespace/keyword                "namespace/keyword"
+    ;; `qualified-name` should return strings as-is
+    "some string"                     "some string"
+    ;; `qualified-name` should work on anything that implements `clojure.lang.Named`
+    (reify clojure.lang.Named
+      (getName [_] "name")
+      (getNamespace [_] "namespace")) "namespace/name"
+    ;; `qualified-name` shouldn't throw an NPE (unlike `name`)
+    nil                               nil)
+  (testing "we shouldn't ignore non-nil values -- `u/qualified-name` should throw an Exception if `name` would"
+    (is (thrown? ClassCastException
+                 (u/qualified-name false)))))
 
-;;; ## tests for ASSOC*
+(deftest rpartial-test
+  (is (= 3
+         ((u/rpartial - 5) 8)))
+  (is (= -7
+         ((u/rpartial - 5 10) 8))))
 
-(expect {:a 100
-         :b 200
-         :c 300}
-  (assoc* {}
-          :a 100
-          :b (+ 100 (:a <>))
-          :c (+ 100 (:b <>))))
+(deftest key-by-test
+  (is (= {1 {:id 1, :name "Rasta"}
+          2 {:id 2, :name "Lucky"}}
+         (u/key-by :id [{:id 1, :name "Rasta"}
+                        {:id 2, :name "Lucky"}]))))
 
+(deftest remove-diacritical-marks-test
+  (doseq [[s expected] {"üuuü" "uuuu"
+                        "åéîü" "aeiu"
+                        "åçñx" "acnx"
+                        ""     nil
+                        nil    nil}]
+    (testing (list 'u/remove-diacritical-marks s)
+      (is (= expected
+             (u/remove-diacritical-marks s))))))
 
-;;; ## tests for HOST-UP?
+(deftest slugify-test
+  (doseq [[group s->expected]
+          {nil
+           {"ToucanFest 2017"               "toucanfest_2017"
+            "Cam's awesome toucan emporium" "cam_s_awesome_toucan_emporium"
+            "Frequently-Used Cards"         "frequently_used_cards"}
 
-(expect true
-  (host-up? "localhost"))
+           "check that diactrics get removed"
+           {"Cam Saul's Toucannery"      "cam_saul_s_toucannery"
+            "toucans dislike piñatas :(" "toucans_dislike_pinatas___" }
 
-(expect false
-  (host-up? "nosuchhost"))
+           "check that non-ASCII characters get URL-encoded (so we can support non-Latin alphabet languages; see #3818)"
+           {"勇士" "%E5%8B%87%E5%A3%AB"}}]
+    (testing group
+      (doseq [[s expected] s->expected]
+        (testing (list 'u/slugify s)
+          (is (= expected
+                 (u/slugify s))))))))
 
-;;; ## tests for HOST-PORT-UP?
+(deftest select-nested-keys-test
+  (are+ [m keyseq expected] (= expected
+                               (u/select-nested-keys m keyseq))
+    {:a 100, :b {:c 200, :d 300}}              [:a [:b :d] :c]   {:a 100, :b {:d 300}}
+    {:a 100, :b {:c 200, :d 300}}              [:b]              {:b {:c 200, :d 300}}
+    {:a 100, :b {:c 200, :d 300}}              [[:b :c :d]]      {:b {:c 200, :d 300}}
+    {:a 100, :b {:c 200, :d {:e 300}}}         [[:b [:d :e]]]    {:b {:d {:e 300}}}
+    {:a 100, :b {:c 200, :d {:e 300}}}         [[:b :d]]         {:b {:d {:e 300}}}
+    {:a {:b 100, :c 200}, :d {:e 300, :f 400}} [[:a :b] [:d :e]] {:a {:b 100}, :d {:e 300}}
+    {:a 100, :b {:c 200, :d 300}}              [[:a]]            {:a 100}
+    {:a 100, :b {:c 200, :d 300}}              [:c]              {}
+    nil                                        [:c]              {}
+    {}                                         nil               {}
+    {:a 100, :b {:c 200, :d 300}}              []                {}
+    {}                                         [:c]              {}))
 
-(expect false
-  (host-port-up? "nosuchhost" 8005))
+(deftest base64-string?-test
+  (are+ [s expected] (= expected
+                        (u/base64-string? s))
+    "ABc"           true
+    "ABc/+asdasd==" true
+    100             false
+    "<<>>"          false
+    "{\"a\": 10}"   false))
 
+(deftest select-keys-test
+  (testing "select-non-nil-keys"
+    (is (= {:a 100}
+           (u/select-non-nil-keys {:a 100, :b nil} #{:a :b :c}))))
+  (testing "select-keys-when"
+    (is (= {:a 100, :b nil, :d 200}
+           (u/select-keys-when {:a 100, :b nil, :d 200, :e nil}
+             :present #{:a :b :c}
+             :non-nil #{:d :e :f})))))
 
-;; ## tests for `(format-num)`
+(deftest order-of-magnitude-test
+  (are+ [n expected] (= expected
+                        (u/order-of-magnitude n))
+    0.01  -2
+    0.5   -1
+    4     0
+    12    1
+    444   2
+    1023  3
+    0     0
+    -1444 3))
 
-;; basic whole number case
-(expect "1" (format-num 1))
-(expect "1" (format-num (float 1)))
-(expect "1" (format-num (double 1)))
-(expect "1" (format-num (bigdec 1)))
-(expect "1" (format-num (long 1)))
-;; make sure we correctly format down to 2 decimal places
-;; note that we are expecting a round DOWN in this case
-(expect "1.23" (format-num (float 1.23444)))
-(expect "1.23" (format-num (double 1.23444)))
-(expect "1.23" (format-num (bigdec 1.23444)))
-;; test that we always force precision of 2 on decimal places
-(expect "1.20" (format-num (float 1.2)))
-(expect "1.20" (format-num (double 1.2)))
-(expect "1.20" (format-num (bigdec 1.2)))
-;; we can take big numbers and add in commas
-(expect "1,234" (format-num 1234))
-(expect "1,234" (format-num (float 1234)))
-(expect "1,234" (format-num (double 1234)))
-(expect "1,234" (format-num (bigdec 1234)))
-(expect "1,234" (format-num (long 1234)))
-;; we can handle numbers with both commas and decimal places
-;; note that we expect a basic round UP here
-(expect "1,234.57" (format-num (float 1234.5678)))
-(expect "1,234.57" (format-num (double 1234.5678)))
-(expect "1,234.57" (format-num (bigdec 1234.5678)))
+(deftest index-of-test
+  (are [input expected] (= expected
+                           (u/index-of pos? input))
+    [-1 0 2 3]   2
+    [-1 0 -2 -3] nil
+    nil          nil
+    []           nil))
 
+(deftest snake-key-test
+  (is (= {:num_cans 2, :lisp_case? {:nested_maps? true}}
+         (u/snake-keys {:num-cans 2, :lisp-case? {:nested-maps? true}}))))
 
-;;; ## tests for IS-URL?
+(deftest one-or-many-test
+  (are+ [input expected] (= expected
+                            (u/one-or-many input))
+    nil   nil
+    [nil] [nil]
+    42    [42]
+    [42]  [42]))
 
-(expect true (is-url? "http://google.com"))
-(expect true (is-url? "https://google.com"))
-(expect true (is-url? "https://amazon.co.uk"))
-(expect true (is-url? "http://google.com?q=my-query&etc"))
-(expect true (is-url? "http://www.cool.com"))
-(expect false (is-url? "google.com"))                      ; missing protocol
-(expect false (is-url? "ftp://metabase.com"))              ; protocol isn't HTTP/HTTPS
-(expect false (is-url? "http://metabasecom"))              ; no period / TLD
-(expect false (is-url? "http://.com"))                     ; no domain
-(expect false (is-url? "http://google."))                  ; no TLD
+(deftest topological-sort-test
+  (are+ [input expected] (= expected
+                            (u/topological-sort identity input))
+    {:b []
+     :c [:a]
+     :e [:d]
+     :d [:a :b :c]
+     :a []}
+    (ordered-map :a [] :b [] :c [:a] :d [:a :b :c] :e [:d])
 
+    {}  nil
+    nil nil))
 
-;;; ## tests for RPARTIAL
+(deftest lower-case-en-test
+  (mt/with-locale "tr"
+    (is (= "id"
+           (u/lower-case-en "ID")))))
 
-(expect 3
-  ((rpartial - 5) 8))
+(deftest upper-case-en-test
+  (mt/with-locale "tr"
+    (is (= "ID"
+           (u/upper-case-en "id")))))
 
-(expect -7
-  ((rpartial - 5 10) 8))
+(deftest parse-currency-test
+  (are+ [s expected] (= expected
+                        (u/parse-currency s))
+    nil             nil
+    ""              nil
+    "   "           nil
+    "$1,000"        1000.0M
+    "$1,000,000"    1000000.0M
+    "$1,000.00"     1000.0M
+    "€1.000"        1000.0M
+    "€1.000,00"     1000.0M
+    "€1.000.000,00" 1000000.0M
+    "-£127.54"      -127.54M
+    "-127,54 €"     -127.54M
+    "kr-127,54"     -127.54M
+    "€ 127,54-"     -127.54M
+    "¥200"          200.0M
+    "¥200."         200.0M
+    "$.05"          0.05M
+    "0.05"          0.05M))
 
-
-;;; ## cond-as->
-(expect 100
-  (cond-as-> 100 <>))
-
-(expect 106
-  (cond-as-> 100 <>
-    true  (+  1 <>)
-    false (+ 10 <>)
-    :ok   (+  5 <>)))
-
-(expect 101
-  (cond-as-> 100 <>
-    (odd? <>)  (inc <>)
-    (even? <>) (inc <>)))
-
-(expect 102
-  (cond-as-> 100 <>
-    (even? <>) (inc <>)
-    (odd? <>)  (inc <>)))
+;; Local Variables:
+;; eval: (add-to-list (make-local-variable 'clojure-align-cond-forms) "are+")
+;; End:

@@ -8,16 +8,13 @@
 
 #import "MetabaseTask.h"
 
-#define ENABLE_JAR_UNPACKING 0
-
 @interface MetabaseTask ()
 
-#if ENABLE_JAR_UNPACKING
-	@property (strong, readonly) NSString *unpack200Path;
-#endif
-
 @property (nonatomic) NSUInteger port;
+@property (nonatomic, strong) NSMutableArray *lastMessages; ///< 10 most recently logged messages.
+
 @end
+
 
 @implementation MetabaseTask
 
@@ -40,26 +37,14 @@
 	regex = [NSRegularExpression regularExpressionWithPattern:@"\\[\\d+m" options:0 error:nil];
 	message = [regex stringByReplacingMatchesInString:message options:0 range:NSMakeRange(0, message.length) withTemplate:@""];
 	
+
+    // add the message to the recently logged messages. If we now have more than 5 remove the oldest
+    [self.lastMessages addObject:message];
+    if (self.lastMessages.count > 10) [self.lastMessages removeObjectAtIndex:0];
+    
+    // log the message the normal way as well
 	NSLog(@"%@", message);
 }
-
-#if ENABLE_JAR_UNPACKING
-/// unpack the jars in the BG if needed the first time around
-- (void)unpackJars {
-	[self.packedJarPaths enumerateObjectsWithOptions:NSEnumerationConcurrent usingBlock:^(NSString *packedFilename, NSUInteger idx, BOOL *stop) {
-		NSString *jarName = [packedFilename stringByReplacingOccurrencesOfString:@".pack.gz" withString:@".jar"];
-		
-		if (![[NSFileManager defaultManager] fileExistsAtPath:jarName]) {
-			NSLog(@"Unpacking %@ ->\n\t%@...", packedFilename, jarName);
-			NSTask *task = [[NSTask alloc] init];
-			task.launchPath = self.unpack200Path;
-			task.arguments = @[packedFilename, jarName];
-			[task launch];
-			[task waitUntilExit];
-		}
-	}];
-}
-#endif
 
 - (void)deleteOldDBLockFilesIfNeeded {
 	NSString *lockFile	= [DBPath() stringByAppendingString:@".lock.db"];
@@ -81,26 +66,32 @@
 
 - (void)launch {
 	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-		
-		#if ENABLE_JAR_UNPACKING
-			[self unpackJars];
-		#endif
-		
 		[self deleteOldDBLockFilesIfNeeded];
 				
 		NSLog(@"Starting MetabaseTask @ 0x%zx...", (size_t)self);
 		
-		self.task					= [[NSTask alloc] init];
-		self.task.launchPath		= JREPath();
-		self.task.environment		= @{@"MB_DB_FILE": DBPath(),
-										@"MB_JETTY_PORT": @(self.port)};
-		self.task.arguments			= @[@"-jar", UberjarPath()];
+		self.task				= [[NSTask alloc] init];
+		self.task.launchPath	= JREPath();
+		self.task.environment	= @{@"MB_DB_FILE": DBPath(),
+									@"MB_PLUGINS_DIR": PluginsDirPath(),
+									@"MB_JETTY_PORT": @(self.port),
+									@"MB_CLIENT": @"OSX"};
+		self.task.arguments		= @[@"-Djava.awt.headless=true", // this prevents the extra java icon from popping up in the dock when running
+                                    @"-client",                  // make sure we're running in -client mode, which has a faster lanuch time
+                                    @"-Xverify:none",            // disable bytecode verification for faster launch speed, not really needed here since JAR is packaged as part of signed .app
+									@"-jar", UberjarPath()];
 				
 		__weak MetabaseTask *weakSelf = self;
 		self.task.terminationHandler = ^(NSTask *task){
-			NSLog(@"\n\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Task terminated with exit code %d !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", task.terminationStatus);
+			NSLog(@"\n\n!!!!! Task terminated with exit code %d !!!!!\n\n", task.terminationStatus);
+            
 			dispatch_async(dispatch_get_main_queue(), ^{
-				if ([[NSAlert alertWithMessageText:@"Fatal Error" defaultButton:@"Restart" alternateButton:@"Quit" otherButton:nil informativeTextWithFormat:@"The Metabase server terminated unexpectedly."] runModal] == NSAlertDefaultReturn) {
+				if ([[NSAlert alertWithMessageText:@"Fatal Error"
+                                     defaultButton:@"Restart"
+                                   alternateButton:@"Quit"
+                                       otherButton:nil
+                         informativeTextWithFormat:@"The Metabase server terminated unexpectedly.\n\nMessages:\n%@", [weakSelf.lastMessages componentsJoinedByString:@""]] // components should already have newline at end
+                     runModal] == NSAlertDefaultReturn) {
 					[weakSelf launch];
 				} else {
 					exit(task.terminationStatus);
@@ -108,7 +99,7 @@
 			});
 		};
 												
-		NSLog(@"Launching MetabaseTask\nMB_DB_FILE='%@' MB_JETTY_PORT=%lu %@ -jar %@", DBPath(), self.port, JREPath(), UberjarPath());
+		NSLog(@"Launching MetabaseTask\nMB_DB_FILE='%@'\nMB_PLUGINS_DIR='%@'\nMB_JETTY_PORT=%lu\n%@ -jar %@", DBPath(), PluginsDirPath(), self.port, JREPath(), UberjarPath());
 		[self.task launch];
 	});
 }
@@ -116,6 +107,10 @@
 - (void)terminate {
 	[super terminate];
 	_port = 0;
+}
+
+- (void)disableTerminationAlert {
+    self.task.terminationHandler = nil;
 }
 
 
@@ -129,15 +124,11 @@
 	}
 	return _port;
 }
+                        
 
-#if ENABLE_JAR_UNPACKING
-- (NSArray *)packedJarPaths {
-	return [[NSBundle mainBundle] pathsForResourcesOfType:@"pack.gz" inDirectory:@"jre/lib"];
+- (NSMutableArray *)lastMessages {
+    if (!_lastMessages) _lastMessages = [NSMutableArray array];
+    return _lastMessages;
 }
-
-- (NSString *)unpack200Path {
-	return [[NSBundle mainBundle] pathForResource:@"unpack200" ofType:nil inDirectory:@"jre/bin"];
-}
-#endif
 
 @end

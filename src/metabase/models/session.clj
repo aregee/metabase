@@ -1,29 +1,23 @@
 (ns metabase.models.session
-  (:require [korma.core :as k]
-            (metabase.models [common :refer :all]
-                             [interface :refer :all]
-                             [user :refer [User]])
-            [metabase.util :as u]))
+  (:require [metabase.util :as u]
+            [toucan
+             [db :as db]
+             [models :as models]]))
 
-(defentity Session
-  [(k/table :core_session)
-   (k/belongs-to User {:fk :user_id})]
+(models/defmodel Session :core_session)
 
-  (pre-insert [_ session]
-    (let [defaults {:created_at (u/new-sql-timestamp)}]
-      (merge defaults session))))
+(defn- pre-insert [session]
+  (assoc session :created_at :%now))
 
+(u/strict-extend (class Session)
+  models/IModel
+  (merge models/IModelDefaults
+         {:pre-insert pre-insert}))
 
 ;; Persistence Functions
 
 (defn first-session-for-user
   "Retrieves the first Session `:id` for a given user (if available), or nil otherwise."
-  [user-id]
+  ^String [user-id]
   {:pre [(integer? user-id)]}
-  (-> (k/select Session
-        (k/fields :id)
-        (k/where {:user_id user-id})
-        (k/order :created_at :ASC)
-        (k/limit 1))
-      first
-      :id))
+  (db/select-one-id Session, :user_id user-id, {:order-by [[:created_at :asc]]}))

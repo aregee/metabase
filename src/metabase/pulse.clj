@@ -1,329 +1,276 @@
 (ns metabase.pulse
-  (:require [hiccup.core :refer [html h]]
-            [clj-time.core :as t]
-            [clj-time.coerce :as c]
-            [clj-time.format :as f]
-            [clojure.java.io :as io]
-            [clojure.tools.logging :as log]
-            [clojure.pprint :refer [cl-format]]
-            [clojure.string :refer [upper-case]]
-            [metabase.models.setting :as setting]))
+  "Public API for sending Pulses."
+  (:require [clojure.tools.logging :as log]
+            [metabase
+             [email :as email]
+             [query-processor :as qp]
+             [util :as u]]
+            [metabase.email.messages :as messages]
+            [metabase.integrations.slack :as slack]
+            [metabase.middleware.session :as session]
+            [metabase.models
+             [card :refer [Card]]
+             [database :refer [Database]]
+             [pulse :as pulse :refer [Pulse]]]
+            [metabase.pulse.render :as render]
+            [metabase.query-processor.timezone :as qp.timezone]
+            [metabase.util
+             [i18n :refer [deferred-tru trs tru]]
+             [ui-logic :as ui]
+             [urls :as urls]]
+            [schema.core :as s]
+            [toucan.db :as db])
+  (:import metabase.models.card.CardInstance))
 
-;; NOTE: hiccup does not escape content by default so be sure to use "h" to escape any user-controlled content :-/
+;;; ------------------------------------------------- PULSE SENDING --------------------------------------------------
 
-;;; ## CONFIG
 
-(def ^:const card-width 400)
-(def ^:const rows-limit 10)
-(def ^:const cols-limit 3)
-(def ^:const sparkline-dot-radius 6)
-(def ^:const sparkline-thickness 3)
-(def ^:const sparkline-pad 8)
+;; TODO - this is probably something that could live somewhere else and just be reused
+;; TODO - this should be done async
+(defn execute-card
+  "Execute the query for a single Card. `options` are passed along to the Query Processor."
+  [{pulse-creator-id :creator_id} card-or-id & {:as options}]
+  (let [card-id (u/get-id card-or-id)]
+    (try
+      (when-let [{query :dataset_query, :as card} (Card :id card-id, :archived false)]
+        (let [query (assoc query :async? false)]
+          (session/with-current-user pulse-creator-id
+            {:card   card
+             :result (qp/process-query-and-save-with-max-results-constraints!
+                      query
+                      (merge {:executed-by pulse-creator-id
+                              :context     :pulse
+                              :card-id     card-id}
+                             options))})))
+      (catch Throwable e
+        (log/warn e (trs "Error running query for Card {0}" card-id))))))
 
-;;; ## STYLES
+(defn- database-id [card]
+  (or (:database_id card)
+      (get-in card [:dataset_query :database])))
 
-(def ^:const color-brand  "rgb(45,134,212)")
-(def ^:const color-purple "rgb(135,93,175)")
-(def ^:const color-grey-1 "rgb(248,248,248)")
-(def ^:const color-grey-2 "rgb(189,193,191)")
-(def ^:const color-grey-3 "rgb(124,131,129)")
-(def ^:const color-grey-4 "rgb(57,67,64)")
+(s/defn defaulted-timezone :- s/Str
+  "Returns the timezone ID for the given `card`. Either the report timezone (if applicable) or the JVM timezone."
+  [card :- CardInstance]
+  (or (some-> card database-id Database qp.timezone/results-timezone-id)
+      (qp.timezone/system-timezone-id)))
 
-(def ^:const font-style    "font-family: Lato, \"Helvetica Neue\", Helvetica, Arial, sans-serif;")
-(def ^:const section-style (str font-style))
-(def ^:const header-style  (str font-style "font-size: 16px; font-weight: 700; color: " color-grey-4 "; text-decoration: none;"))
-(def ^:const scalar-style  (str font-style "font-size: 24px; font-weight: 700; color: " color-brand ";"))
-(def ^:const bar-th-style  (str font-style "font-size: 10px; font-weight: 400; color: " color-grey-4 "; border-bottom: 4px solid " color-grey-1 "; padding-top: 0px; padding-bottom: 10px;"))
-(def ^:const bar-td-style  (str font-style "font-size: 16px; font-weight: 400; text-align: left; padding-right: 1em; padding-top: 8px;"))
-(def ^:const button-style  (str font-style "display: inline-block; box-sizing: border-box; padding: 8px; color: " color-brand "; border: 1px solid " color-brand "; border-radius: 4px; text-decoration: none; "))
+(defn- first-question-name [pulse]
+  (-> pulse :cards first :name))
 
-;;; ## HELPER FNS
+(defn- alert-condition-type->description [condition-type]
+  (case (keyword condition-type)
+    :meets (trs "reached its goal")
+    :below (trs "gone below its goal")
+    :rows  (trs "results")))
 
-(defn datetime-field?
-  [field]
-  (or (contains? #{:DateTimeField :TimeField :DateField} (:base_type field))
-      (contains? #{:timestamp_seconds :timestamp_milliseconds} (:special_type field))))
+(defn create-slack-attachment-data
+  "Returns a seq of slack attachment data structures, used in `create-and-upload-slack-attachments!`"
+  [card-results]
+  (let [{channel-id :id} (slack/files-channel)]
+    (for [{{card-id :id, card-name :name, :as card} :card, result :result} card-results]
+      {:title                  card-name
+       :attachment-bytes-thunk (fn [] (render/render-pulse-card-to-png (defaulted-timezone card) card result))
+       :title_link             (urls/card-url card-id)
+       :attachment-name        "image.png"
+       :channel-id             channel-id
+       :fallback               card-name})))
 
-(defn number-field?
-  [field]
-  (or (contains? #{:IntegerField :DecimalField :FloatField :BigIntegerField} (:base_type field))
-      (contains? #{:number} (:special_type field))))
+(defn create-and-upload-slack-attachments!
+  "Create an attachment in Slack for a given Card by rendering its result into an image and uploading it."
+  [attachments]
+  (doall
+   (for [{:keys [attachment-bytes-thunk attachment-name channel-id] :as attachment-data} attachments]
+     (let [slack-file-url (slack/upload-file! (attachment-bytes-thunk) attachment-name channel-id)]
+       (-> attachment-data
+           (select-keys [:title :title_link :fallback])
+           (assoc :image_url slack-file-url))))))
 
-;;; ## FORMATTING
-
-(defn- format-number
-  [n]
-  (if (integer? n) (cl-format nil "~:d" n) (cl-format nil "~,2f" n)))
-
-(defn- format-timestamp
-  "Formats timestamps with human friendly absolute dates based on the column :unit"
-  [timestamp col]
-  (case (:unit col)
-    :hour (f/unparse (f/formatter "h a - MMM YYYY") (c/from-long timestamp))
-    :week (str "Week " (f/unparse (f/formatter "w - YYYY") (c/from-long timestamp)))
-    :month (f/unparse (f/formatter "MMMM YYYY") (c/from-long timestamp))
-    :quarter (str "Q" (+ 1 (int (/ (t/month (c/from-long timestamp)) 3))) " - " (t/year (c/from-long timestamp)))
-    :year (str timestamp)
-    :hour-of-day (str timestamp) ; TODO: probably shouldn't even be showing sparkline for x-of-y groupings?
-    :day-of-week (str timestamp)
-    :week-of-year (str timestamp)
-    :month-of-year (str timestamp)
-    (f/unparse (f/formatter "MMM d, YYYY") (c/from-long timestamp))))
-
-(defn- format-timestamp-relative
-  "Formats timestamps with relative names (today, yesterday, this *, last *) based on column :unit, if possible, otherwie returns nil"
-  [timestamp col]
-  (case (:unit col)
-    :day      (let [date    (c/from-long timestamp)
-                    d-start (t/date-midnight (t/year (t/now)) (t/month (t/now)) (t/day (t/now)))]
-                (cond (t/within? (t/interval d-start (t/plus d-start (t/days 1))) date) "Today"
-                      (t/within? (t/interval (t/minus d-start (t/days 1)) d-start) date) "Yesterday"))
-    :week     (let [date    (c/from-long timestamp)
-                    w-start (-> (new org.joda.time.LocalDate) .weekOfWeekyear .roundFloorCopy .toDateTimeAtStartOfDay)]
-                (cond (t/within? (t/interval w-start (t/plus w-start (t/weeks 1))) date) "This week"
-                      (t/within? (t/interval (t/minus w-start (t/weeks 1)) w-start) date) "Last week"))
-    :month    (let [date    (c/from-long timestamp)
-                    m-start  (t/date-midnight (t/year (t/now)) (t/month (t/now)))]
-                (cond (t/within? (t/interval m-start (t/plus m-start (t/months 1))) date) "This month"
-                      (t/within? (t/interval (t/minus m-start (t/months 1)) m-start) date) "Last month"))
-    :quarter  (let [date    (c/from-long timestamp)
-                    q-start (t/date-midnight (t/year (t/now)) (+ 1 (* 3 (Math/floor (/ (- (t/month (t/now)) 1) 3)))))]
-                (cond (t/within? (t/interval q-start (t/plus q-start (t/months 3))) date) "This quarter"
-                      (t/within? (t/interval (t/minus q-start (t/months 3)) q-start) date) "Last quarter"))
-    :year     (let [date    (t/date-midnight timestamp)
-                    y-start (t/date-midnight (t/year (t/now)))]
-                (cond (t/within? (t/interval y-start (t/plus y-start (t/years 1))) date) "This year"
-                      (t/within? (t/interval (t/minus y-start (t/years 1)) y-start) date) "Last year"))
-    nil))
-
-(defn format-timestamp-pair
-  "Formats a pair of timestamps, using relative formatting for the first timestamps if possible and 'Previous :unit' for the second, otherwise absolute timestamps for both"
-  [[a b] col]
-  (if-let [a' (format-timestamp-relative a col)]
-    [a' (str "Previous " (-> col :unit name))]
-    [(format-timestamp a col) (format-timestamp b col)]))
-
-(defn- format-cell
-  [value col]
-  (cond
-    (instance? java.util.Date value) (format-timestamp (.getTime value) col)
-    (and (number? value) (not (datetime-field? col))) (format-number value)
-    :else (str value)))
-
-;;; ## RENDERING
-
-(defn card-href
+(defn- is-card-empty?
+  "Check if the card is empty"
   [card]
-  (h (str (setting/get :-site-url) "/card/" (:id card) "?clone")))
+  (let [result (:result card)]
+    (or (zero? (-> result :row_count))
+        ;; Many aggregations result in [[nil]] if there are no rows to aggregate after filters
+        (= [[nil]]
+           (-> result :data :rows)))))
 
-; ported from https://github.com/radkovo/CSSBox/blob/cssbox-4.10/src/main/java/org/fit/cssbox/demo/ImageRenderer.java
-(defn render-to-png
-  [html, os, width]
-  (let [is (new java.io.ByteArrayInputStream (.getBytes html java.nio.charset.StandardCharsets/UTF_8))
-        docSource (new org.fit.cssbox.io.StreamDocumentSource is nil "text/html")
-        parser (new org.fit.cssbox.io.DefaultDOMSource docSource)
-        doc (-> parser .parse)
-        windowSize (new java.awt.Dimension width 1)
-        media (new cz.vutbr.web.css.MediaSpec "screen")]
-    (.setDimensions media (.width windowSize) (.height windowSize))
-    (.setDeviceDimensions media (.width windowSize) (.height windowSize))
-    (let [da (new org.fit.cssbox.css.DOMAnalyzer doc (.getURL docSource))]
-      (.setMediaSpec da media)
-      (.attributesToStyles da)
-      (.addStyleSheet da nil (org.fit.cssbox.css.CSSNorm/stdStyleSheet) org.fit.cssbox.css.DOMAnalyzer$Origin/AGENT)
-      (.addStyleSheet da nil (org.fit.cssbox.css.CSSNorm/userStyleSheet) org.fit.cssbox.css.DOMAnalyzer$Origin/AGENT)
-      (.addStyleSheet da nil (org.fit.cssbox.css.CSSNorm/formsStyleSheet) org.fit.cssbox.css.DOMAnalyzer$Origin/AGENT)
-      (.getStyleSheets da)
-      (let [contentCanvas (new org.fit.cssbox.layout.BrowserCanvas (.getRoot da) da (.getURL docSource))]
-        (-> contentCanvas (.setAutoMediaUpdate false))
-        (-> contentCanvas (.setAutoSizeUpdate true))
-        (-> contentCanvas .getConfig (.setClipViewport false))
-        (-> contentCanvas .getConfig (.setLoadImages true))
-        (-> contentCanvas .getConfig (.setLoadBackgroundImages true))
-        (-> contentCanvas (.createLayout windowSize))
-        (javax.imageio.ImageIO/write (.getImage contentCanvas) "png" os)))))
+(defn- are-all-cards-empty?
+  "Do none of the cards have any results?"
+  [results]
+  (every? is-card-empty? results))
 
-(defn render-html-to-png
-  [html-body width]
-  (let [html (html [:html [:body {:style "margin: 0; padding: 0; background-color: white;"} html-body]])
-        os (new java.io.ByteArrayOutputStream)]
-    (render-to-png html os width)
-    (.toByteArray os)))
+(defn- goal-met? [{:keys [alert_above_goal] :as pulse} results]
+  (let [first-result         (first results)
+        goal-comparison      (if alert_above_goal <= >=)
+        goal-val             (ui/find-goal-value first-result)
+        comparison-col-rowfn (ui/make-goal-comparison-rowfn (:card first-result)
+                                                            (get-in first-result [:result :data]))]
 
-(defn render-img-data-uri
-  "Takes a PNG byte array and returns a Base64 encoded URI"
-  [img-bytes]
-  (str "data:image/png;base64," (new String (org.fit.cssbox.misc.Base64Coder/encode img-bytes))))
-
-(defn render-button
-  [text href icon render-img]
-  [:a {:style button-style :href href}
-    [:span (h text)]
-    (if icon [:img {:style "margin-left: 4px; width: 16px;"
-                    :width 16
-                    :src (-> (str "frontend_client/app/img/" icon "@2x.png") io/resource io/input-stream org.apache.commons.io.IOUtils/toByteArray render-img)}])])
+    (when-not (and goal-val comparison-col-rowfn)
+      (throw (Exception. (str (deferred-tru "Unable to compare results to goal for alert.")
+                              " "
+                              (deferred-tru "Question ID is ''{0}'' with visualization settings ''{1}''"
+                                        (get-in results [:card :id])
+                                        (pr-str (get-in results [:card :visualization_settings])))))))
+    (some (fn [row]
+            (goal-comparison goal-val (comparison-col-rowfn row)))
+          (get-in first-result [:result :data :rows]))))
 
 
-(defn render-table
-  [card rows cols render-img include-buttons col-indexes bar-column]
-  (let [max-value (if bar-column (apply max (map bar-column rows)))]
-    [:table {:style (str "padding-bottom: 8px; border-bottom: 4px solid " color-grey-1 ";")}
-      [:thead
-        [:tr
-          (for [col-idx col-indexes :let [col (-> cols (nth col-idx))]]
-            [:th {:style (str bar-td-style bar-th-style "min-width: 60px;")}
-              (h (upper-case (name (or (:display_name col) (:name col)))))])
-          (if bar-column
-            [:th {:style (str bar-td-style bar-th-style "width: 99%;")}])]]
-      [:tbody
-        (map-indexed (fn [row-idx row]
-          [:tr {:style (str "color: " (if (odd? row-idx) color-grey-2 color-grey-3) ";")}
-            (for [col-idx col-indexes :let [col (-> cols (nth col-idx))]]
-              [:td {:style (str bar-td-style (if (and bar-column (= col-idx 1)) "font-weight: 700;"))}
-                (-> row (nth col-idx) (format-cell col) h)])
-            (if bar-column
-              [:td {:style (str bar-td-style "width: 99%;")}
-                [:div {:style (str "background-color: " color-purple "; max-height: 10px; height: 10px; border-radius: 2px; width: " (float (* 100 (/ (bar-column row) max-value))) "%")} "&#160;"]])])
-          rows)]]))
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                         Creating Notifications To Send                                         |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn render-truncation-warning
-  [card {:keys [cols rows] :as data} render-img include-buttons rows-limit cols-limit]
-  (if (or (> (count rows) rows-limit)
-          (> (count cols) cols-limit))
-    [:div {:style "padding-top: 16px;"}
-      (if (> (count rows) rows-limit)
-        [:div {:style (str "color: " color-grey-2 "; padding-bottom: 10px;")}
-          "Showing " [:strong {:style (str "color: " color-grey-3 ";")} (format-number rows-limit)]
-          " of "     [:strong {:style (str "color: " color-grey-3 ";")} (format-number (count rows))]
-          " rows."])
-      (if (> (count cols) cols-limit)
-        [:div {:style (str "color: " color-grey-2 "; padding-bottom: 10px;")}
-          "Showing " [:strong {:style (str "color: " color-grey-3 ";")} (format-number cols-limit)]
-          " of "     [:strong {:style (str "color: " color-grey-3 ";")} (format-number (count cols))]
-          " columns."])]))
+(defn- alert-or-pulse [pulse]
+  (if (:alert_condition pulse)
+    :alert
+    :pulse))
 
-(defn render-card-table
-  [card {:keys [cols rows] :as data} render-img include-buttons]
-  (let [truncated-rows (take rows-limit rows)
-        truncated-cols (take cols-limit cols)
-        col-indexes (map-indexed (fn [i _] i) truncated-cols)]
-    [:div
-      (render-table card truncated-rows truncated-cols render-img include-buttons col-indexes nil)
-      (render-truncation-warning card data render-img include-buttons rows-limit cols-limit)]))
+(defmulti ^:private should-send-notification?
+  "Returns true if given the pulse type and resultset a new notification (pulse or alert) should be sent"
+  (fn [pulse _results] (alert-or-pulse pulse)))
 
-(defn render-card-bar
-  [card {:keys [cols rows] :as data} render-img include-buttons]
-  (let [truncated-rows (take rows-limit rows)]
-    [:div
-      (render-table card truncated-rows cols render-img include-buttons [0 1] second)
-      (render-truncation-warning card data render-img include-buttons rows-limit 2)]))
+(defmethod should-send-notification? :alert
+  [{:keys [alert_condition] :as alert} results]
+  (cond
+    (= "rows" alert_condition)
+    (not (are-all-cards-empty? results))
 
-(defn render-card-scalar
-  [card {:keys [cols rows] :as data} render-img include-buttons]
-  [:div {:style scalar-style}
-    (-> rows first first (format-cell (first cols)) h)])
+    (= "goal" alert_condition)
+    (goal-met? alert results)
 
-(defn render-sparkline-to-png
-  "Takes two arrays of numbers between 0 and 1 and plots them as a sparkline"
-  [xs ys width height]
-  (let [os (new java.io.ByteArrayOutputStream)
-        image (new java.awt.image.BufferedImage (+ width (* 2 sparkline-pad)) (+ height (* 2 sparkline-pad)) java.awt.image.BufferedImage/TYPE_INT_ARGB)
-        g2 (.createGraphics image)
-        xt (map #(+ sparkline-pad (* width %)) xs)
-        yt (map #(+ sparkline-pad (- height (* height %))) ys)]
-    (.setRenderingHints g2 (new java.awt.RenderingHints java.awt.RenderingHints/KEY_ANTIALIASING java.awt.RenderingHints/VALUE_ANTIALIAS_ON))
-    (.setColor g2 (new java.awt.Color 211 227 241))
-    (.setStroke g2 (new java.awt.BasicStroke sparkline-thickness java.awt.BasicStroke/CAP_ROUND java.awt.BasicStroke/JOIN_ROUND))
-    (.drawPolyline g2 (int-array (count xt) xt) (int-array (count yt) yt) (count xt))
-    (.setColor g2 (new java.awt.Color 45 134 212))
-    (.fillOval g2 (- (last xt) sparkline-dot-radius) (- (last yt) sparkline-dot-radius) (* 2 sparkline-dot-radius) (* 2 sparkline-dot-radius))
-    (.setColor g2 java.awt.Color/white)
-    (.setStroke g2 (new java.awt.BasicStroke 2))
-    (.drawOval g2 (- (last xt) sparkline-dot-radius) (- (last yt) sparkline-dot-radius) (* 2 sparkline-dot-radius) (* 2 sparkline-dot-radius))
-    (javax.imageio.ImageIO/write image "png" os)
-    (.toByteArray os)))
+    :else
+    (let [^String error-text (tru "Unrecognized alert with condition ''{0}''" alert_condition)]
+      (throw (IllegalArgumentException. error-text)))))
 
-(defn render-card-sparkline
-  [card {:keys [rows cols] :as data} render-img include-buttons]
-  (let [xs (for [row rows :let [x (first row)]] (if (instance? java.util.Date x) (.getTime x) x))
-        xmin (apply min xs)
-        xmax (apply max xs)
-        xrange (- xmax xmin)
-        xs' (map #(/ (- % xmin) xrange) xs)
-        ys (map second rows)
-        ymin (apply min ys)
-        ymax (apply max ys)
-        yrange (max 1 (- ymax ymin)) ; `(max 1 ...)` so we don't divide by zero
-        ys' (map #(/ (- % ymin) yrange) ys)
-        rows' (->> rows (take-last 2) (reverse))
-        values (map #(format-number (second %)) rows')
-        labels (format-timestamp-pair (map first rows') (first cols))]
-  [:div
-    [:img {:style "display: block; width: 100%;" :src (render-img (render-sparkline-to-png xs' ys' 524 130))}]
-    [:table
-      [:tr
-        [:td {:style (str "color: " color-brand "; font-size: 24px; font-weight: 700; padding-right: 16px;")} (first values)]
-        [:td {:style (str "color: " color-grey-3 "; font-size: 24px; font-weight: 700;")} (second values)]]
-      [:tr
-        [:td {:style (str "color: " color-brand "; font-size: 16px; font-weight: 700; padding-right: 16px;")} (first labels)]
-        [:td {:style (str "color: " color-grey-3 "; font-size: 16px;")} (second labels)]]]]))
+(defmethod should-send-notification? :pulse
+  [{:keys [alert_condition] :as pulse} results]
+  (if (:skip_if_empty pulse)
+    (not (are-all-cards-empty? results))
+    true))
 
-(defn render-card-empty
-  [card {:keys [rows cols] :as data} render-img include-buttons]
-  [:div {:style "text-align: center;"}
-    [:img {:style "width: 104px;"
-             :src (-> (str "frontend_client/app/img/pulse_no_results@2x.png") io/resource io/input-stream org.apache.commons.io.IOUtils/toByteArray render-img)}]
-    [:div {:style (str "margin-top: 8px; color: " color-grey-4 ";")} "No results"]])
+(defmulti ^:private notification
+  "Polymorphoic function for creating notifications. This logic is different for pulse type (i.e. alert vs. pulse) and
+  channel_type (i.e. email vs. slack)"
+  {:arglists '([alert-or-pulse results channel])}
+  (fn [pulse _ {:keys [channel_type] :as channel}]
+    [(alert-or-pulse pulse) (keyword channel_type)]))
 
-(defn detect-pulse-card-type
-  [card data]
-  (let [col-count (-> data :cols count)
-        row-count (-> data :rows count)
-        col-1 (-> data :cols first)
-        col-2 (-> data :cols second)
-        aggregation (-> card :dataset_query :query :aggregation first)]
-    (cond
-      (or (= aggregation :rows)
-          (contains? #{:pin_map :state :country} (:display card)))        nil
-      (= row-count 0)                                                     :empty
-      (and (= col-count 1) (= row-count 1))                               :scalar
-      (and (= col-count 2) (datetime-field? col-1) (number-field? col-2)) :sparkline
-      (and (= col-count 2) (number-field? col-2))                         :bar
-      :else                                                               :table)))
+(defmethod notification [:pulse :email]
+  [{pulse-id :id, pulse-name :name, :as pulse} results {:keys [recipients] :as channel}]
+  (log/debug (u/format-color 'cyan (trs "Sending Pulse ({0}: {1}) with {2} Cards via email"
+                                        pulse-id (pr-str pulse-name) (count results))))
+  (let [email-subject    (trs "Pulse: {0}" pulse-name)
+        email-recipients (filterv u/email? (map :email recipients))
+        timezone         (-> results first :card defaulted-timezone)]
+    {:subject      email-subject
+     :recipients   email-recipients
+     :message-type :attachments
+     :message      (messages/render-pulse-email timezone pulse results)}))
 
-(defn render-pulse-card
-  [card data render-img include-title include-buttons]
-  (try
-    [:a {:href (card-href card)
-         :target "_blank"
-         :style (str section-style "margin: 16px; margin-bottom: 16px; display: block; text-decoration: none;")}
-      (if include-title
-          [:table {:style "margin-bottom: 8px; width: 100%;"}
-            [:tbody
-              [:tr
-                [:td [:span {:style header-style} (-> card :name h)]]
-                [:td {:style "text-align: right;"}
-                  (if include-buttons [:img {:style "width: 16px;"
-                                             :width 16
-                                             :src (-> (str "frontend_client/app/img/external_link.png") io/resource io/input-stream org.apache.commons.io.IOUtils/toByteArray render-img)}])]]]])
-      (case (detect-pulse-card-type card data)
-        :empty     (render-card-empty     card data render-img include-buttons)
-        :scalar    (render-card-scalar    card data render-img include-buttons)
-        :sparkline (render-card-sparkline card data render-img include-buttons)
-        :bar       (render-card-bar       card data render-img include-buttons)
-        :table     (render-card-table     card data render-img include-buttons)
-        [:div {:style (str font-style "color: #F9D45C; font-weight: 700;")}
-          "We were unable to display this card." [:br] "Please view this card in Metabase."])]
-  (catch Throwable e
-    (log/warn (str "Pulse card render error:" e))
-    [:div {:style (str font-style "color: #EF8C8C; font-weight: 700;")} "An error occurred while displaying this card."])))
+(defmethod notification [:pulse :slack]
+  [{pulse-id :id, pulse-name :name, :as pulse} results {{channel-id :channel} :details :as channel}]
+  (log/debug (u/format-color 'cyan (trs "Sending Pulse ({0}: {1}) with {2} Cards via Slack"
+                                        pulse-id (pr-str pulse-name) (count results))))
+  {:channel-id  channel-id
+   :message     (str "Pulse: " pulse-name)
+   :attachments (create-slack-attachment-data results)})
+
+(defmethod notification [:alert :email]
+  [{:keys [id] :as pulse} results {:keys [recipients]}]
+  (log/debug (trs "Sending Alert ({0}: {1}) via email" id name))
+  (let [condition-kwd    (messages/pulse->alert-condition-kwd pulse)
+        email-subject    (trs "Metabase alert: {0} has {1}"
+                              (first-question-name pulse)
+                              (alert-condition-type->description condition-kwd))
+        email-recipients (filterv u/email? (map :email recipients))
+        first-result     (first results)
+        timezone         (-> first-result :card defaulted-timezone)]
+    {:subject      email-subject
+     :recipients   email-recipients
+     :message-type :attachments
+     :message      (messages/render-alert-email timezone pulse results (ui/find-goal-value first-result))}))
+
+(defmethod notification [:alert :slack]
+  [pulse results {{channel-id :channel} :details}]
+  (log/debug (u/format-color 'cyan (trs "Sending Alert ({0}: {1}) via Slack" (:id pulse) (:name pulse))))
+  {:channel-id  channel-id
+   :message     (trs "Alert: {0}" (first-question-name pulse))
+   :attachments (create-slack-attachment-data results)})
+
+(defmethod notification :default
+  [_ _ {:keys [channel_type]}]
+  (throw (UnsupportedOperationException. (tru "Unrecognized channel type {0}" (pr-str channel_type)))))
+
+(defn- results->notifications [{:keys [channels channel-ids], pulse-id :id, :as pulse} results]
+  (let [channel-ids (or channel-ids (mapv :id channels))]
+    (when (should-send-notification? pulse results)
+      (when (:alert_first_only pulse)
+        (db/delete! Pulse :id pulse-id))
+      ;; `channel-ids` is the set of channels to send to now, so only send to those. Note the whole set of channels
+      (for [channel channels
+            :when   (contains? (set channel-ids) (:id channel))]
+        (notification pulse results channel)))))
+
+(defn- pulse->notifications [{:keys [cards], pulse-id :id, :as pulse}]
+  (let [results (for [card  cards
+                      ;; Pulse ID may be `nil` if the Pulse isn't saved yet
+                      :let  [result (execute-card pulse (u/get-id card), :pulse-id pulse-id)]
+                      ;; some cards may return empty results, e.g. if the card has been archived
+                      :when result]
+                  result)]
+    (results->notifications pulse results)))
 
 
-(defn render-pulse-section
-  [render-img include-buttons {:keys [card result]}]
-  [:div {:style (str "margin-top: 10px; margin-bottom: 20px; border: 1px solid #dddddd; border-radius: 2px; background-color: white; box-shadow: 0 1px 2px rgba(0, 0, 0, .08);")}
-    (render-pulse-card card (:data result) render-img true include-buttons)])
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                             Sending Notifications                                              |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defn render-pulse-card-to-png
-  [card data include-title]
-  (render-html-to-png (render-pulse-card card data render-img-data-uri include-title false) card-width))
+(defmulti ^:private send-notification!
+  "Invokes the side-affecty function for sending emails/slacks depending on the notification type"
+  {:arglists '([pulse-or-alert])}
+  (fn [{:keys [channel-id]}]
+    (if channel-id :slack :email)))
+
+(defmethod send-notification! :slack
+  [{:keys [channel-id message attachments]}]
+  (let [attachments (create-and-upload-slack-attachments! attachments)]
+    (slack/post-chat-message! channel-id message attachments)))
+
+(defmethod send-notification! :email
+  [{:keys [subject recipients message-type message]}]
+  (email/send-message!
+    :subject      subject
+    :recipients   recipients
+    :message-type message-type
+    :message      message))
+
+(defn- send-notifications! [notifications]
+  (doseq [notification notifications]
+    ;; do a try-catch around each notification so if one fails, we'll still send the other ones for example, an Alert
+    ;; set up to send over both Slack & email: if Slack fails, we still want to send the email (#7409)
+    (try
+      (send-notification! notification)
+      (catch Throwable e
+        (log/error e (trs "Error sending notification!"))))))
+
+(defn send-pulse!
+  "Execute and Send a `Pulse`, optionally specifying the specific `PulseChannels`.  This includes running each
+   `PulseCard`, formatting the results, and sending the results to any specified destination.
+
+  `channel-ids` is the set of channel IDs to send to *now* -- this may be a subset of the full set of channels for
+  the Pulse.
+
+   Example:
+       (send-pulse! pulse)                       Send to all Channels
+       (send-pulse! pulse :channel-ids [312])    Send only to Channel with :id = 312"
+  [{:keys [cards], :as pulse} & {:keys [channel-ids]}]
+  {:pre [(map? pulse)]}
+  (let [pulse (-> pulse
+                  pulse/map->PulseInstance
+                  ;; This is usually already done by this step, in the `send-pulses` task which uses `retrieve-pulse`
+                  ;; to fetch the Pulse.
+                  pulse/hydrate-notification
+                  (merge (when channel-ids {:channel-ids channel-ids})))]
+    (send-notifications! (pulse->notifications pulse))))
